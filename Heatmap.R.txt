@@ -1,0 +1,444 @@
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(SeuratObject)
+  library(dplyr)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(grid)
+})
+
+# =====================================================
+# User-defined inputs
+# =====================================================
+
+input_rdata <- "IM01_Immune_Seurat_object_nodups-013.RData"
+output_file <- "M1_M2_heatmap_tall.png"
+show_gene_names <- TRUE
+
+# =====================================================
+# Helper functions
+# =====================================================
+
+load_seurat_object <- function(rdata_path, object_name = "tiss_immune") {
+  env <- new.env()
+  load(rdata_path, envir = env)
+
+  if (!exists(object_name, envir = env)) {
+    stop(sprintf("Object '%s' was not found in '%s'.", object_name, rdata_path))
+  }
+
+  obj <- get(object_name, envir = env)
+  UpdateSeuratObject(obj)
+}
+
+get_expr_matrix <- function(seu, features, cells = NULL) {
+  if (is.null(cells)) {
+    cells <- colnames(seu)
+  }
+
+  features <- intersect(features, rownames(seu))
+  cells <- intersect(cells, colnames(seu))
+
+  if (length(features) == 0) {
+    stop("None of the requested features were found in the Seurat object.")
+  }
+  if (length(cells) == 0) {
+    stop("None of the requested cells were found in the Seurat object.")
+  }
+
+  expr <- tryCatch(
+    GetAssayData(seu, slot = "data")[features, cells, drop = FALSE],
+    error = function(e1) {
+      tryCatch(
+        GetAssayData(seu, layer = "data")[features, cells, drop = FALSE],
+        error = function(e2) {
+          stop("Could not extract expression matrix using slot = 'data' or layer = 'data'.")
+        }
+      )
+    }
+  )
+
+  as.matrix(expr)
+}
+
+add_separator_line <- function(heatmap_name) {
+  decorate_heatmap_body(heatmap_name, slice = 1, {
+    grid.lines(
+      x = unit(c(1, 1), "npc"),
+      y = unit(c(0, 1), "npc"),
+      gp = gpar(col = "black", lwd = 1.2)
+    )
+  })
+}
+
+# =====================================================
+# Load data
+# =====================================================
+
+tiss_immune <- load_seurat_object(input_rdata)
+
+# =====================================================
+# Select object of interest
+# =====================================================
+
+if (exists("mf_monocytes_lung")) {
+  obj <- mf_monocytes_lung
+} else if (exists("mf_monocytes")) {
+  obj <- mf_monocytes
+} else {
+  meta_cols_all <- colnames(tiss_immune@meta.data)
+
+  if (all(c("immune_subtype_annotation", "biopsy_site") %in% meta_cols_all)) {
+    obj <- subset(
+      tiss_immune,
+      subset = immune_subtype_annotation == "MF-Monocytes" & biopsy_site == "Lung"
+    )
+  } else if ("immune_subtype_annotation" %in% meta_cols_all) {
+    obj <- subset(
+      tiss_immune,
+      subset = immune_subtype_annotation == "MF-Monocytes"
+    )
+    warning("Column 'biopsy_site' not found; subsetting only by 'immune_subtype_annotation'.")
+  } else {
+    stop("Could not find 'immune_subtype_annotation' in metadata.")
+  }
+}
+
+if (ncol(obj) == 0) {
+  stop("The selected object contains 0 cells after subsetting.")
+}
+
+# =====================================================
+# Gene sets
+# =====================================================
+
+M1 <- c(
+  "CCR7", "IL2RA", "IL15RA", "IL7R", "CXCL11", "CCL19", "CXCL10", "CXCL9",
+  "TNF", "CCL5", "CCL15", "IL12B", "IL6", "CCL20", "BCL2A1", "FAS",
+  "BIRC3", "GADD45G", "SLC7A5", "SLC2A6", "SLC31A2", "PLA1A", "OASL",
+  "CHI3L2", "HSD11B1", "AK3", "SPHK1", "PFKFB3", "PSME2", "PFKP",
+  "PSMB9", "PSMA2", "OAS2", "PTX3", "APOL3", "IGFBP4", "APOL1",
+  "PDGFA", "EDN1", "APOL2", "INHBA", "APOL6", "HESX1", "IRF1",
+  "ATF3", "IRF7"
+)
+
+M2 <- c(
+  "TGFBR2", "HRH1", "TLR5", "MSR1", "CXCR4", "P2RY14", "MS4A4A", "MRC1",
+  "IGF1", "CCL23", "CCL18", "CCL13", "SLC4A7", "SLC38A6", "CTSC",
+  "HEXB", "LIPA", "ADK", "HNMT", "TPST2", "CERK", "HS3ST2", "LTA4H",
+  "CA2", "ALOX15", "HS3ST1", "TGFBI", "SEPP1", "CHN2", "FN1", "FGL2",
+  "GAS7", "EGR2", "MAF"
+)
+
+M1_present <- intersect(M1, rownames(obj))
+M2_present <- intersect(M2, rownames(obj))
+
+if (length(M1_present) == 0 || length(M2_present) == 0) {
+  stop("No M1 and/or M2 genes matched the object.")
+}
+
+plot_genes <- c(M1_present, M2_present)
+
+# =====================================================
+# Module scores
+# =====================================================
+
+meta_cols <- colnames(obj@meta.data)
+
+if (!all(c("M1_score", "M2_score", "M1_M2_score") %in% meta_cols)) {
+  obj <- AddModuleScore(
+    object = obj,
+    features = list(M1_present, M2_present),
+    name = "M"
+  )
+
+  m_cols <- grep("^M[0-9]+$", colnames(obj@meta.data), value = TRUE)
+
+  if (length(m_cols) < 2) {
+    stop("Could not detect AddModuleScore output columns automatically.")
+  }
+
+  obj$M1_score <- obj@meta.data[[m_cols[1]]]
+  obj$M2_score <- obj@meta.data[[m_cols[2]]]
+  obj$M1_M2_score <- obj$M1_score - obj$M2_score
+}
+
+# =====================================================
+# Order cells by score
+# =====================================================
+
+meta_heatmap <- obj@meta.data
+meta_heatmap$cell_id <- rownames(meta_heatmap)
+
+meta_heatmap <- meta_heatmap %>%
+  arrange(M1_M2_score)
+
+rownames(meta_heatmap) <- meta_heatmap$cell_id
+
+# =====================================================
+# Expression matrix and z-score transformation
+# =====================================================
+
+mat <- get_expr_matrix(obj, features = plot_genes, cells = meta_heatmap$cell_id)
+
+mat <- t(scale(t(mat)))
+mat[is.na(mat)] <- 0
+mat[mat > 2] <- 2
+mat[mat < -2] <- -2
+
+# =====================================================
+# Order genes
+# =====================================================
+
+gene_medians <- apply(mat, 1, median)
+
+M1_ordered <- names(sort(gene_medians[M1_present], decreasing = FALSE))
+M2_ordered <- names(sort(gene_medians[M2_present], decreasing = TRUE))
+
+plot_genes_ordered <- c(M1_ordered, M2_ordered)
+mat <- mat[plot_genes_ordered, , drop = FALSE]
+
+row_group <- factor(
+  c(rep("M1 genes", length(M1_ordered)),
+    rep("M2 genes", length(M2_ordered))),
+  levels = c("M1 genes", "M2 genes")
+)
+
+# =====================================================
+# BMMF annotation table
+# =====================================================
+
+bmmf_table <- data.frame(
+  cell_id = c(
+    "A12_B000422", "B4_B001016", "F3_B000422", "G13_B003577", "N11_B001016",
+    "O14_B003577", "P11_B003179", "B5_B001007", "M10_B001016", "J14_B001475"
+  ),
+  bmmf_status = c(
+    "BMMF1", "BMMF1", "BMMF1", "BMMF1", "BMMF1/2",
+    "BMMF1", "BMMF1", "BMMF2", "BMMF2", "BMMF4"
+  ),
+  stringsAsFactors = FALSE
+)
+
+meta_heatmap$bmmf <- "Negative"
+meta_heatmap$bmmf_status <- NA_character_
+
+match_idx <- match(meta_heatmap$cell_id, bmmf_table$cell_id)
+is_pos <- !is.na(match_idx)
+
+meta_heatmap$bmmf[is_pos] <- "Positive"
+meta_heatmap$bmmf_status[is_pos] <- bmmf_table$bmmf_status[match_idx[is_pos]]
+
+meta_heatmap$bmmf_main <- ifelse(
+  meta_heatmap$bmmf == "Positive" & !is.na(meta_heatmap$bmmf_status),
+  meta_heatmap$bmmf_status,
+  "Negative"
+)
+
+# =====================================================
+# Colors
+# =====================================================
+
+score_range <- range(meta_heatmap$M1_M2_score, na.rm = TRUE)
+if (diff(score_range) == 0) {
+  score_range <- c(score_range[1] - 1, score_range[2] + 1)
+}
+
+score_col_fun <- colorRamp2(
+  c(score_range[1], 0, score_range[2]),
+  c("blue", "white", "red")
+)
+
+expr_col_fun <- colorRamp2(
+  c(-2, 0, 2),
+  c("steelblue", "white", "firebrick")
+)
+
+bmmf_cols <- c(
+  "BMMF1" = "#0072B2",
+  "BMMF2" = "#D62728",
+  "BMMF1/2" = "#8A2BE2",
+  "BMMF4" = "#4D4D4D"
+)
+
+bmmf_main_cols <- c(
+  "Negative" = "white",
+  "BMMF1" = "#0072B2",
+  "BMMF2" = "#D62728",
+  "BMMF1/2" = "#8A2BE2",
+  "BMMF4" = "#4D4D4D"
+)
+
+# =====================================================
+# Main panel annotation
+# =====================================================
+
+left_anno_main <- rowAnnotation(
+  BMMF_main = anno_simple(
+    meta_heatmap$bmmf_main,
+    col = bmmf_main_cols,
+    border = TRUE
+  ),
+  `M1-M2 score` = anno_simple(
+    meta_heatmap$M1_M2_score,
+    col = score_col_fun,
+    border = FALSE
+  ),
+  show_annotation_name = FALSE,
+  show_legend = c(
+    BMMF_main = FALSE,
+    `M1-M2 score` = TRUE
+  )
+)
+
+# =====================================================
+# Main heatmap
+# =====================================================
+
+ht_main <- Heatmap(
+  t(mat),
+  name = "zscore_main",
+  col = expr_col_fun,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  show_row_names = FALSE,
+  show_column_names = show_gene_names,
+  column_names_gp = gpar(fontsize = 5, fontface = "bold"),
+  column_names_rot = 60,
+  column_split = row_group,
+  column_gap = unit(2, "mm"),
+  border = FALSE,
+  rect_gp = gpar(col = NA),
+  left_annotation = left_anno_main,
+  column_title_gp = gpar(fontsize = 12, fontface = "bold"),
+  heatmap_legend_param = list(
+    title = "z-score",
+    title_gp = gpar(fontsize = 10, fontface = "bold"),
+    labels_gp = gpar(fontsize = 9)
+  )
+)
+
+# =====================================================
+# Positive-only panel
+# =====================================================
+
+meta_pos <- meta_heatmap[meta_heatmap$bmmf == "Positive", , drop = FALSE]
+
+if (nrow(meta_pos) == 0) {
+  stop("No BMMF-positive cells from the provided list were found in the object.")
+}
+
+meta_pos$bmmf_status <- factor(
+  meta_pos$bmmf_status,
+  levels = c("BMMF1", "BMMF2", "BMMF1/2", "BMMF4")
+)
+
+mat_pos <- mat[, meta_pos$cell_id, drop = FALSE]
+mat_pos_t <- t(mat_pos)
+
+score_range_pos <- range(meta_pos$M1_M2_score, na.rm = TRUE)
+if (diff(score_range_pos) == 0) {
+  score_range_pos <- c(score_range_pos[1] - 1, score_range_pos[2] + 1)
+}
+
+score_col_fun_pos <- colorRamp2(
+  c(score_range_pos[1], 0, score_range_pos[2]),
+  c("blue", "white", "red")
+)
+
+left_anno_pos <- rowAnnotation(
+  BMMF = meta_pos$bmmf_status,
+  `M1-M2 score` = meta_pos$M1_M2_score,
+  col = list(
+    BMMF = bmmf_cols,
+    `M1-M2 score` = score_col_fun_pos
+  ),
+  show_annotation_name = FALSE,
+  show_legend = c(
+    BMMF = TRUE,
+    `M1-M2 score` = FALSE
+  )
+)
+
+ht_pos <- Heatmap(
+  mat_pos_t,
+  name = "zscore_pos",
+  col = expr_col_fun,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  show_row_names = FALSE,
+  show_column_names = show_gene_names,
+  column_names_gp = gpar(fontsize = 5, fontface = "bold"),
+  column_names_rot = 60,
+  column_split = row_group,
+  column_gap = unit(2, "mm"),
+  border = FALSE,
+  rect_gp = gpar(col = NA),
+  left_annotation = left_anno_pos,
+  height = unit(2.8, "cm"),
+  show_heatmap_legend = FALSE
+)
+
+# =====================================================
+# Spacer between panels
+# =====================================================
+
+spacer_mat <- matrix(0, nrow = 1, ncol = ncol(t(mat)))
+colnames(spacer_mat) <- colnames(t(mat))
+rownames(spacer_mat) <- "spacer"
+
+ht_spacer <- Heatmap(
+  spacer_mat,
+  name = "spacer",
+  col = colorRamp2(c(0, 1), c("white", "white")),
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  show_row_names = FALSE,
+  show_column_names = FALSE,
+  show_heatmap_legend = FALSE,
+  border = FALSE,
+  rect_gp = gpar(col = NA, fill = "white"),
+  height = unit(4, "mm")
+)
+
+# =====================================================
+# Combine heatmaps
+# =====================================================
+
+ht_combined <- ht_main %v% ht_spacer %v% ht_pos
+
+# =====================================================
+# Draw to device
+# =====================================================
+
+draw_heatmap <- function(ht) {
+  draw(
+    ht,
+    merge_legends = TRUE,
+    heatmap_legend_side = "right",
+    annotation_legend_side = "right",
+    padding = unit(c(14, 12, 16, 18), "mm")
+  )
+}
+
+ht_drawn <- draw_heatmap(ht_combined)
+add_separator_line("zscore_main")
+add_separator_line("zscore_pos")
+
+# =====================================================
+# Export high-resolution PNG
+# =====================================================
+
+png(
+  filename = output_file,
+  width = 3200,
+  height = 3600,
+  res = 300,
+  type = "cairo"
+)
+
+draw_heatmap(ht_combined)
+add_separator_line("zscore_main")
+add_separator_line("zscore_pos")
+
+dev.off()
